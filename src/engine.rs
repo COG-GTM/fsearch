@@ -260,12 +260,23 @@ impl Engine {
         }
         // Pick files under the lock, read them after releasing it: reading can
         // be slow and a waiting writer would stall every other query.
-        let paths = {
+        let mut paths = {
             let l = self.s.live.read().unwrap();
             let Some(live) = l.as_ref() else { return Err(INDEXING.into()) };
             search_pool().install(|| content::scan_paths(live, q.clone_for_scan()))
         };
-        Ok((content::verify(g, &paths, q.limit), false))
+        let found = paths.len();
+        let protect = (!g.allow_protected).then_some(home);
+        if protect.is_some() {
+            paths.retain(|p| !content::scan_protected(p, home));
+        }
+        let mut r = content::verify(g, &paths, q.limit, protect);
+        r.withheld = found - paths.len();
+        // Withheld files may have used up the candidate cap.
+        if r.withheld > 0 && found >= content::SCAN_CAP {
+            r.complete = false;
+        }
+        Ok((r, false))
     }
 
     pub fn status(&self) -> Status {

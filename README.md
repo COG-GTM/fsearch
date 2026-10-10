@@ -78,6 +78,17 @@ let engine = fsearch::Engine::start(fsearch::Options { dir: fsearch::default_dir
 let hits = engine.search(&fsearch::Query::parse("fsearch main", &home)?)?;
 ```
 
+The daemon answers only processes running as your user (checked with
+`getpeereid`), and the socket is `0600` in a `0700` folder. It often holds
+Full Disk Access when its client doesn't, so a content search that has to
+scan files outside the content index (`in:/etc`) skips folders macOS
+protects with that grant: `~/Library`, `~/.Trash`, photo libraries, other
+users' homes, `/private/var`, `/Volumes` and the like. Those files still
+show up in name search. Each file is checked again by its real path after
+it is opened, so a symlink or renamed folder cannot alias them. The server
+also caps `limit` (10,000 hits, 1,000 files for grep), `per_file` (100) and
+`budget_ms` (5 s).
+
 An app and the CLI share one index: the first process owns it and the
 others follow along.
 

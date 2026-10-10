@@ -653,6 +653,30 @@ pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
     !rel.split(|&b| b == b'/').any(|c| SKIP_DIRS.contains(&c) || SKIP_SUFFIXES.iter().any(|x| c.len() > x.len() && c.ends_with(x)))
 }
 
+/// Folders macOS releases only to apps with Full Disk Access (Mail,
+/// Messages, Safari, app containers, the Trash, other users and volumes).
+/// A daemon often holds that grant while its clients don't, so a scan
+/// (`in:` outside the content index) never reads them unless asked to.
+const PROTECTED_IN_HOME: &[&[u8]] = &[b"Library", b".Trash"];
+#[rustfmt::skip]
+const PROTECTED: &[&[u8]] = &[
+    b"/private/var", b"/Library/Application Support/com.apple.TCC", b"/System/Volumes", b"/Volumes", b"/.MobileBackups",
+];
+
+/// Is `path` (file or directory) in a Full Disk Access protected folder?
+pub fn scan_protected(path: &[u8], home: &[u8]) -> bool {
+    let under = |p: &[u8], root: &[u8]| p.starts_with(root) && (p.len() == root.len() || p[root.len()] == b'/');
+    if path.split(|&b| b == b'/').any(|c| c.ends_with(b".photoslibrary")) {
+        return true;
+    }
+    if let Some(rest) = path.strip_prefix(home).filter(|r| r.first().is_none_or(|&b| b == b'/')) {
+        let rel = rest.strip_prefix(b"/").unwrap_or(rest);
+        return PROTECTED_IN_HOME.iter().any(|p| under(rel, p));
+    }
+    // Other users' homes: everything under /Users but yours and Shared.
+    (under(path, b"/Users") && path.len() > b"/Users".len() && !under(path, b"/Users/Shared")) || PROTECTED.iter().any(|p| under(path, p))
+}
+
 /// Candidate order tier: your files first, then dot-dirs, logs and transcripts.
 fn doc_rank(path: &[u8]) -> i8 {
     let mut r = 0i8;
@@ -844,7 +868,7 @@ impl Content {
         let plan = g.plan();
         let cands = self.candidates(&plan, filt);
         let paths: Vec<&[u8]> = cands.iter().map(|&(si, d)| self.segs[si].path(d)).collect();
-        verify(g, &paths, filt.limit)
+        verify(g, &paths, filt.limit, None)
     }
 }
 
@@ -911,6 +935,9 @@ pub struct Grep {
     pub max_per_file: usize,
     /// Stop reading candidates after this long (None = read them all).
     pub budget: Option<std::time::Duration>,
+    /// Let a scan read Full Disk Access protected folders (see
+    /// `scan_protected`). Off by default; the daemon never sets it.
+    pub allow_protected: bool,
     re: Regex,
 }
 
@@ -931,7 +958,14 @@ impl Grep {
             .size_limit(1 << 26)
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Grep { pattern: pattern.to_string(), mode, max_per_file: 5, budget: Some(std::time::Duration::from_millis(250)), re })
+        Ok(Grep {
+            pattern: pattern.to_string(),
+            mode,
+            max_per_file: 5,
+            budget: Some(std::time::Duration::from_millis(250)),
+            allow_protected: false,
+            re,
+        })
     }
 
     fn plan(&self) -> TQ {
@@ -952,6 +986,8 @@ pub struct GrepResult {
     pub read: usize,
     /// False if the time budget ran out before every candidate was read.
     pub complete: bool,
+    /// Scan candidates skipped because they are in protected folders.
+    pub withheld: usize,
 }
 
 /// File opens on this Mac stop scaling past ~4 threads (Endpoint Security
@@ -982,7 +1018,9 @@ pub struct FileMatches {
 /// Read candidates in rank order, in parallel batches, until `limit` files
 /// have matched or the time budget is spent (best-ranked results first, so a
 /// cut-short search still returns the ones you most likely wanted).
-pub fn verify(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize) -> GrepResult {
+/// With `protect` (the home folder), a file whose real path is protected is
+/// skipped even if it was reached through a symlink or a renamed folder.
+pub fn verify(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize, protect: Option<&[u8]>) -> GrepResult {
     let t = std::time::Instant::now();
     let mut r = GrepResult { candidates: paths.len(), ..Default::default() };
     let mut at = 0;
@@ -992,7 +1030,7 @@ pub fn verify(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize) -> Grep
             break;
         }
         let end = (at + batch).min(paths.len());
-        let found: Vec<Option<FileMatches>> = read_pool().install(|| paths[at..end].par_iter().map(|p| match_file(g, p.as_ref())).collect());
+        let found: Vec<Option<FileMatches>> = read_pool().install(|| paths[at..end].par_iter().map(|p| match_file(g, p.as_ref(), protect)).collect());
         r.read += end - at;
         r.files.extend(found.into_iter().flatten());
         at = end;
@@ -1009,11 +1047,17 @@ thread_local! {
     static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
+fn match_file(g: &Grep, path: &[u8], protect: Option<&[u8]>) -> Option<FileMatches> {
     READ_BUF.with_borrow_mut(|buf| {
         use std::io::Read;
         buf.clear();
-        open_regular(path)?.take(MAX_FILE * 4).read_to_end(buf).ok()?;
+        let f = open_regular(path)?;
+        if let Some(home) = protect
+            && real_path(&f).is_none_or(|p| scan_protected(&p, home))
+        {
+            return None;
+        }
+        f.take(MAX_FILE * 4).read_to_end(buf).ok()?;
         if memchr::memchr(0, &buf[..buf.len().min(8192)]).is_some() {
             return None;
         }
@@ -1210,12 +1254,15 @@ fn regex_plan(h: &Hir) -> TQ {
     and(i.q, exact_query(i.exact))
 }
 
+/// Most candidates a scan considers.
+pub const SCAN_CAP: usize = 200_000;
+
 /// Files to grep where the content index does not reach (e.g. `in:/etc`),
 /// picked from the name index instead of crawling, newest first. `q` is the
 /// name query restricted to the files worth reading.
 pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
     q.kind = Some(KIND_FILE);
-    q.limit = 200_000;
+    q.limit = SCAN_CAP;
     q.size = (q.size.0, q.size.1.min(MAX_FILE));
     let mut files: Vec<(Vec<u8>, u32)> = (crate::query::Searcher { live }.search(&q).into_iter())
         .map(|h| match h.over {
@@ -1243,4 +1290,52 @@ pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
     f.metadata().ok()?.is_file().then_some(f)
+}
+
+/// Where the kernel says an open file lives, whatever path opened it.
+fn real_path(f: &std::fs::File) -> Option<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    buf.truncate(memchr::memchr(0, &buf)?);
+    Some(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_protected;
+
+    #[test]
+    fn protected_folders() {
+        let home = b"/Users/me";
+        for p in [
+            &b"/Users/me/Library"[..],
+            b"/Users/me/Library/Messages/chat.db",
+            b"/Users/me/Library/Mail/V10/x.emlx",
+            b"/Users/me/.Trash/a.txt",
+            b"/Users/me/Pictures/Photos Library.photoslibrary/database/Photos.sqlite",
+            b"/Users/other/notes.txt",
+            b"/private/var/db/x",
+            b"/Library/Application Support/com.apple.TCC/TCC.db",
+            b"/Volumes/Backup/x",
+            b"/System/Volumes/Data/Users/me/Library/Messages/chat.db",
+        ] {
+            assert!(scan_protected(p, home), "{}", String::from_utf8_lossy(p));
+        }
+        for p in [
+            &b"/Users/me/code/node_modules/a/index.js"[..],
+            b"/Users/me/LibraryNotes/a.txt",
+            b"/Users/me/.config/x.toml",
+            b"/Users/Shared/a.txt",
+            b"/Users",
+            b"/private/etc/hosts",
+            b"/private/varnish",
+            b"/usr/local/etc/a.conf",
+            b"/Library/Preferences/a.plist",
+        ] {
+            assert!(!scan_protected(p, home), "{}", String::from_utf8_lossy(p));
+        }
+    }
 }

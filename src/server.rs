@@ -5,9 +5,17 @@ use fsearch::walk::{KIND_DIR, KIND_FILE, KIND_LINK};
 use fsearch::{Engine, GrepMode, Options, Query};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Server-side caps: a client can't ask for an unbounded dump.
+const MAX_HITS: usize = 10_000;
+const MAX_GREP_FILES: usize = 1_000;
+const MAX_PER_FILE: usize = 100;
+const MAX_BUDGET: Duration = Duration::from_secs(5);
 
 pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("fsearch.sock")
@@ -17,6 +25,8 @@ pub fn serve(dir: PathBuf, home: String) {
     // One daemon per socket. (The engine's own lock decides who writes the
     // index: an app embedding fsearch may own it while the daemon follows.)
     std::fs::create_dir_all(&dir).ok();
+    // Only this user may reach the socket (or the index next to it).
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     // Opened without truncating: a loser must not wipe the owner's pid.
     let Ok(mut lock) = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join("socket.lock")) else { return };
     if !try_lock(&lock) {
@@ -35,14 +45,25 @@ pub fn serve(dir: PathBuf, home: String) {
     let sock = socket_path(&dir);
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).expect("bind socket");
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).expect("chmod socket");
     for conn in listener.incoming().flatten() {
+        if !peer_is_self(&conn) {
+            eprintln!("{} refused a connection from another user", fsearch::query::now_secs());
+            continue;
+        }
         let e = engine.clone();
         std::thread::spawn(move || handle(conn, &e));
     }
 }
 
+/// The daemon may hold Full Disk Access, so it answers only its own user.
+fn peer_is_self(conn: &UnixStream) -> bool {
+    let (mut uid, mut gid) = (0, 0);
+    unsafe { libc::getpeereid(conn.as_raw_fd(), &mut uid, &mut gid) == 0 && uid == libc::geteuid() }
+}
+
 fn try_lock(f: &std::fs::File) -> bool {
-    unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(f), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
 /// Stop the daemon serving `dir`, if one is running, and wait until it has
@@ -148,6 +169,7 @@ fn run(v: &Value, engine: &Engine) -> Result<Value, String> {
 /// which files are read.
 fn grep(v: &Value, engine: &Engine) -> Result<Value, String> {
     let mut q = parse_request(v, engine.home())?;
+    q.limit = q.limit.min(MAX_GREP_FILES);
     let mode = match v.get("mode").and_then(Value::as_str) {
         Some("regex") => GrepMode::Regex,
         Some("symbol") => GrepMode::Symbol,
@@ -158,10 +180,11 @@ fn grep(v: &Value, engine: &Engine) -> Result<Value, String> {
     let pattern = v.get("pattern").and_then(Value::as_str).map(str::to_string).or(q.grep.take()).ok_or("grep needs a pattern")?;
     let mut g = fsearch::Grep::new(&pattern, mode)?;
     if let Some(n) = v.get("per_file").and_then(Value::as_u64) {
-        g.max_per_file = n as usize;
+        g.max_per_file = (n as usize).min(MAX_PER_FILE);
     }
+    // 0 means the longest allowed.
     if let Some(ms) = v.get("budget_ms").and_then(Value::as_u64) {
-        g.budget = (ms > 0).then(|| Duration::from_millis(ms));
+        g.budget = Some(if ms == 0 { MAX_BUDGET } else { Duration::from_millis(ms).min(MAX_BUDGET) });
     }
     let t = Instant::now();
     let (r, indexed) = engine.grep(&q, &g)?;
@@ -182,6 +205,7 @@ fn grep(v: &Value, engine: &Engine) -> Result<Value, String> {
         "candidates": r.candidates,
         "read": r.read,
         "complete": r.complete,
+        "withheld": r.withheld,
         "indexing": engine.status().content_pending,
         "files": files,
     }))
@@ -204,6 +228,7 @@ fn parse_request(v: &Value, home: &str) -> Result<Query, String> {
             }
         }
     }
+    q.limit = q.limit.min(MAX_HITS);
     Ok(q)
 }
 
