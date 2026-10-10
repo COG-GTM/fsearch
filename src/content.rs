@@ -653,6 +653,30 @@ pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
     !rel.split(|&b| b == b'/').any(|c| SKIP_DIRS.contains(&c) || SKIP_SUFFIXES.iter().any(|x| c.len() > x.len() && c.ends_with(x)))
 }
 
+/// Folders macOS releases only to apps with Full Disk Access (Mail,
+/// Messages, Safari, app containers, the Trash, other users and volumes).
+/// A daemon often holds that grant while its clients don't, so a scan
+/// (`in:` outside the content index) never reads them unless asked to.
+const PROTECTED_IN_HOME: &[&[u8]] = &[b"Library", b".Trash"];
+#[rustfmt::skip]
+const PROTECTED: &[&[u8]] = &[
+    b"/private/var", b"/Library/Application Support/com.apple.TCC", b"/System/Volumes", b"/Volumes", b"/.MobileBackups",
+];
+
+/// Is `path` (file or directory) in a Full Disk Access protected folder?
+pub fn scan_protected(path: &[u8], home: &[u8]) -> bool {
+    let under = |p: &[u8], root: &[u8]| p.starts_with(root) && (p.len() == root.len() || p[root.len()] == b'/');
+    if path.split(|&b| b == b'/').any(|c| c.ends_with(b".photoslibrary")) {
+        return true;
+    }
+    if let Some(rest) = path.strip_prefix(home).filter(|r| r.first().is_none_or(|&b| b == b'/')) {
+        let rel = rest.strip_prefix(b"/").unwrap_or(rest);
+        return PROTECTED_IN_HOME.iter().any(|p| under(rel, p));
+    }
+    // Other users' homes: everything under /Users but yours and Shared.
+    (under(path, b"/Users") && path.len() > b"/Users".len() && !under(path, b"/Users/Shared")) || PROTECTED.iter().any(|p| under(path, p))
+}
+
 /// Candidate order tier: your files first, then dot-dirs, logs and transcripts.
 fn doc_rank(path: &[u8]) -> i8 {
     let mut r = 0i8;
@@ -911,6 +935,9 @@ pub struct Grep {
     pub max_per_file: usize,
     /// Stop reading candidates after this long (None = read them all).
     pub budget: Option<std::time::Duration>,
+    /// Let a scan read Full Disk Access protected folders (see
+    /// `scan_protected`). Off by default; the daemon never sets it.
+    pub allow_protected: bool,
     re: Regex,
 }
 
@@ -931,7 +958,14 @@ impl Grep {
             .size_limit(1 << 26)
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Grep { pattern: pattern.to_string(), mode, max_per_file: 5, budget: Some(std::time::Duration::from_millis(250)), re })
+        Ok(Grep {
+            pattern: pattern.to_string(),
+            mode,
+            max_per_file: 5,
+            budget: Some(std::time::Duration::from_millis(250)),
+            allow_protected: false,
+            re,
+        })
     }
 
     fn plan(&self) -> TQ {
@@ -952,6 +986,8 @@ pub struct GrepResult {
     pub read: usize,
     /// False if the time budget ran out before every candidate was read.
     pub complete: bool,
+    /// Scan candidates skipped because they are in protected folders.
+    pub withheld: usize,
 }
 
 /// File opens on this Mac stop scaling past ~4 threads (Endpoint Security
@@ -1243,4 +1279,41 @@ pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
     f.metadata().ok()?.is_file().then_some(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_protected;
+
+    #[test]
+    fn protected_folders() {
+        let home = b"/Users/me";
+        for p in [
+            &b"/Users/me/Library"[..],
+            b"/Users/me/Library/Messages/chat.db",
+            b"/Users/me/Library/Mail/V10/x.emlx",
+            b"/Users/me/.Trash/a.txt",
+            b"/Users/me/Pictures/Photos Library.photoslibrary/database/Photos.sqlite",
+            b"/Users/other/notes.txt",
+            b"/private/var/db/x",
+            b"/Library/Application Support/com.apple.TCC/TCC.db",
+            b"/Volumes/Backup/x",
+            b"/System/Volumes/Data/Users/me/Library/Messages/chat.db",
+        ] {
+            assert!(scan_protected(p, home), "{}", String::from_utf8_lossy(p));
+        }
+        for p in [
+            &b"/Users/me/code/node_modules/a/index.js"[..],
+            b"/Users/me/LibraryNotes/a.txt",
+            b"/Users/me/.config/x.toml",
+            b"/Users/Shared/a.txt",
+            b"/Users",
+            b"/private/etc/hosts",
+            b"/private/varnish",
+            b"/usr/local/etc/a.conf",
+            b"/Library/Preferences/a.plist",
+        ] {
+            assert!(!scan_protected(p, home), "{}", String::from_utf8_lossy(p));
+        }
+    }
 }
