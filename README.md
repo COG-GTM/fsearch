@@ -84,7 +84,8 @@ Full Disk Access when its client doesn't, so a content search that has to
 scan files outside the content index (`in:/etc`) skips folders macOS
 protects with that grant: `~/Library`, `~/.Trash`, photo libraries, other
 users' homes, `/private/var`, `/Volumes` and the like. Those files still
-show up in name search. The server also caps `limit` (10,000 hits, 1,000
+show up in name search, and each file is checked again by its real path
+after it is opened, so a symlink or renamed folder cannot alias them. The server also caps `limit` (10,000 hits, 1,000
 files for grep), `per_file` (100) and `budget_ms` (5 s).
 
 An app and the CLI share one index: the first process owns it and the

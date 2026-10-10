@@ -266,11 +266,16 @@ impl Engine {
             search_pool().install(|| content::scan_paths(live, q.clone_for_scan()))
         };
         let found = paths.len();
-        if !g.allow_protected {
+        let protect = (!g.allow_protected).then_some(home);
+        if protect.is_some() {
             paths.retain(|p| !content::scan_protected(p, home));
         }
-        let mut r = content::verify(g, &paths, q.limit);
+        let mut r = content::verify(g, &paths, q.limit, protect);
         r.withheld = found - paths.len();
+        // Withheld files may have used up the candidate cap.
+        if r.withheld > 0 && found >= content::SCAN_CAP {
+            r.complete = false;
+        }
         Ok((r, false))
     }
 

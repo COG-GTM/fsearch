@@ -868,7 +868,7 @@ impl Content {
         let plan = g.plan();
         let cands = self.candidates(&plan, filt);
         let paths: Vec<&[u8]> = cands.iter().map(|&(si, d)| self.segs[si].path(d)).collect();
-        verify(g, &paths, filt.limit)
+        verify(g, &paths, filt.limit, None)
     }
 }
 
@@ -1018,7 +1018,9 @@ pub struct FileMatches {
 /// Read candidates in rank order, in parallel batches, until `limit` files
 /// have matched or the time budget is spent (best-ranked results first, so a
 /// cut-short search still returns the ones you most likely wanted).
-pub fn verify(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize) -> GrepResult {
+/// With `protect` (the home folder), a file whose real path is protected is
+/// skipped even if it was reached through a symlink or a renamed folder.
+pub fn verify(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize, protect: Option<&[u8]>) -> GrepResult {
     let t = std::time::Instant::now();
     let mut r = GrepResult { candidates: paths.len(), ..Default::default() };
     let mut at = 0;
@@ -1028,7 +1030,7 @@ pub fn verify(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize) -> Grep
             break;
         }
         let end = (at + batch).min(paths.len());
-        let found: Vec<Option<FileMatches>> = read_pool().install(|| paths[at..end].par_iter().map(|p| match_file(g, p.as_ref())).collect());
+        let found: Vec<Option<FileMatches>> = read_pool().install(|| paths[at..end].par_iter().map(|p| match_file(g, p.as_ref(), protect)).collect());
         r.read += end - at;
         r.files.extend(found.into_iter().flatten());
         at = end;
@@ -1045,11 +1047,17 @@ thread_local! {
     static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
+fn match_file(g: &Grep, path: &[u8], protect: Option<&[u8]>) -> Option<FileMatches> {
     READ_BUF.with_borrow_mut(|buf| {
         use std::io::Read;
         buf.clear();
-        open_regular(path)?.take(MAX_FILE * 4).read_to_end(buf).ok()?;
+        let f = open_regular(path)?;
+        if let Some(home) = protect
+            && real_path(&f).is_none_or(|p| scan_protected(&p, home))
+        {
+            return None;
+        }
+        f.take(MAX_FILE * 4).read_to_end(buf).ok()?;
         if memchr::memchr(0, &buf[..buf.len().min(8192)]).is_some() {
             return None;
         }
@@ -1246,12 +1254,15 @@ fn regex_plan(h: &Hir) -> TQ {
     and(i.q, exact_query(i.exact))
 }
 
+/// Most candidates a scan considers.
+pub const SCAN_CAP: usize = 200_000;
+
 /// Files to grep where the content index does not reach (e.g. `in:/etc`),
 /// picked from the name index instead of crawling, newest first. `q` is the
 /// name query restricted to the files worth reading.
 pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
     q.kind = Some(KIND_FILE);
-    q.limit = 200_000;
+    q.limit = SCAN_CAP;
     q.size = (q.size.0, q.size.1.min(MAX_FILE));
     let mut files: Vec<(Vec<u8>, u32)> = (crate::query::Searcher { live }.search(&q).into_iter())
         .map(|h| match h.over {
@@ -1279,6 +1290,17 @@ pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
     f.metadata().ok()?.is_file().then_some(f)
+}
+
+/// Where the kernel says an open file lives, whatever path opened it.
+fn real_path(f: &std::fs::File) -> Option<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    buf.truncate(memchr::memchr(0, &buf)?);
+    Some(buf)
 }
 
 #[cfg(test)]
